@@ -1,12 +1,205 @@
-{
+const express = require('express');
+const crypto = require('crypto');
+const app = express();
+app.use(express.json());
+
+// ============================================
+// CONFIG
+// ============================================
+const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET;
+const PORT = process.env.PORT || 3000;
+
+// Simular base de datos en memoria
+// En producción, usa PostgreSQL, MongoDB, etc
+const payments = new Map(); // paymentId -> { status, amount, machine_id, processed }
+
+// ============================================
+// HELPERS
+// ============================================
+
+// Validar firma del webhook
+function validateWebhookSignature(body, signature, secret) {
+    if (!signature || !secret) {
+        return false;
+    }
+
+    const computedSignature = crypto
+        .createHmac('sha256', secret)
+        .update(JSON.stringify(body))
+        .digest('hex');
+
+    try {
+        return crypto.timingSafeEqual(
+            Buffer.from(signature),
+            Buffer.from(computedSignature)
+        );
+    } catch (error) {
+        return false;
+    }
+}
+
+// Log estructurado
+function log(level, message, data = {}) {
+    console.log(JSON.stringify({
+        timestamp: new Date().toISOString(),
+        level,
+        message,
+        ...data
+    }));
+}
+
+// ============================================
+// RUTAS
+// ============================================
+
+// 1️⃣ WEBHOOK DE MERCADO PAGO
+app.post('/webhook', (req, res) => {
+    try {
+        const signature = req.headers['x-signature'];
+        if (!signature) {
+            log('warn', 'Webhook sin firma', { ip: req.ip });
+            return res.status(401).json({ error: 'Sin firma' });
+        }
+
+        if (!validateWebhookSignature(req.body, signature, MP_WEBHOOK_SECRET)) {
+            log('warn', 'Webhook con firma inválida', { ip: req.ip });
+            return res.status(401).json({ error: 'Firma inválida' });
+        }
+
+        const data = req.body.data || {};
+        const paymentId = data.id;
+
+        if (!paymentId) {
+            log('warn', 'Webhook sin payment ID', { body: req.body });
+            return res.status(400).json({ error: 'Sin payment ID' });
+        }
+
+        if (req.body.action !== 'payment.created' && req.body.action !== 'payment.updated') {
+            log('info', 'Webhook de otro tipo', { action: req.body.action });
+            return res.status(200).json({ ok: true });
+        }
+
+        payments.set(paymentId, {
+            status: 'pending',
+            amount: null,
+            machine_id: null,
+            processed: false,
+            created_at: new Date().toISOString()
+        });
+
+        log('info', 'Webhook recibido', { paymentId, action: req.body.action });
+        res.status(200).json({ ok: true });
+
+    } catch (error) {
+        log('error', 'Error en webhook', { error: error.message });
+        res.status(500).json({ error: 'Error interno' });
+    }
+});
+
+// 2️⃣ ESP32 CONSULTA SI HAY PAGO
+app.get('/check-payment', (req, res) => {
+    try {
+        const machineId = req.query.machine_id;
+        if (!machineId) {
+            return res.status(400).json({
+                error: 'machine_id requerido',
+                status: false
+            });
+        }
+
+        let approvedPayment = null;
+        for (let [paymentId, payment] of payments) {
+            if (payment.status === 'approved' && !payment.processed) {
+                approvedPayment = { paymentId, ...payment };
+                break;
+            }
+        }
+
+        if (approvedPayment) {
+            const payment = payments.get(approvedPayment.paymentId);
+            payment.processed = true;
+
+            log('info', 'Pago entregado', {
+                paymentId: approvedPayment.paymentId,
+                machineId
+            });
+
+            return res.json({
+                status: true,
+                payment_id: approvedPayment.paymentId,
+                amount: approvedPayment.amount
+            });
+        }
+
+        res.json({ status: false });
+
+    } catch (error) {
+        log('error', 'Error en check-payment', { error: error.message });
+        res.status(500).json({ error: 'Error interno', status: false });
+    }
+});
+
+// 3️⃣ ADMIN: Simular pago aprobado (SOLO PARA DESARROLLO)
+app.post('/admin/approve-payment/:paymentId', (req, res) => {
+    if (process.env.NODE_ENV === 'production') {
+        return res.status(403).json({ error: 'No disponible en producción' });
+    }
+
+    const paymentId = req.params.paymentId;
+    const payment = payments.get(paymentId);
+
+    if (!payment) {
+        return res.status(404).json({ error: 'Pago no encontrado' });
+    }
+
+    payment.status = 'approved';
+    payment.amount = req.body.amount || 500;
+    payment.machine_id = req.body.machine_id || 'TEST-001';
+
+    log('info', 'Pago simulado (DEV)', { paymentId });
+    res.json({ ok: true, payment });
+});
+
+// 4️⃣ ADMIN: Ver estado de pagos
+app.get('/admin/payments', (req, res) => {
+    if (process.env.NODE_ENV === 'production') {
+        return res.status(403).json({ error: 'No disponible en producción' });
+    }
+
+    const paymentsList = Array.from(payments.entries()).map(([id, p]) => ({
+        id,
+        ...p
+    }));
+
+    res.json({ payments: paymentsList });
+});
+
+// 5️⃣ HEALTH CHECK
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', uptime: process.uptime() });
+});
+
+// ============================================
+// START
+// ============================================
+app.listen(PORT, () => {
+    if (!MP_WEBHOOK_SECRET) {
+        console.warn('⚠️  MP_WEBHOOK_SECRET no configurado. Los webhooks no serán validados.');
+    }
+    log('info', `Servidor iniciado en puerto ${PORT}`, { environment: process.env.NODE_ENV || 'development' });
+});
+"},{"content":"{
   "name": "vending-cafe-backend",
   "version": "1.0.0",
-  "description": "Backend para cafetera vending",
+  "description": "Backend para cafetera vending con Mercado Pago",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "NODE_ENV=development node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "mercadopago": "^2.1.0"
   }
 }
