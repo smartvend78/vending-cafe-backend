@@ -10,8 +10,7 @@ app.post('/webhook', (req, res) => {
     const payment = req.body;
     console.log("Notificación recibida de MP:", payment);
 
-    // Aquí validaremos después que el pago esté 'approved' y por el monto exacto
-    // Por ahora, marcamos que hay un pago listo para ser consumido
+    // Marcamos que hay un pago listo para ser consumido
     ultimoPagoAprobado = true;
 
     res.status(200).send("OK");
@@ -19,13 +18,13 @@ app.post('/webhook', (req, res) => {
 
 // Ruta 2: El ESP32 consulta constantemente aquí si ya pagaron
 app.get('/check-payment', (req, res) => {
-    if (ultimoPagoAprobado) {
-        res.json({ status: true });
-        // Una vez que el ESP32 lee el pago y da el café, reseteamos la variable
-        ultimoPagoAprobado = false; 
-    } else {
-        res.json({ status: false });
-    }
+    res.json({ status: ultimoPagoAprobado });
+});
+
+// Ruta 3: El ESP32 avisa que ya procesó el pago para limpiar la variable
+app.post('/clear-payment', (req, res) => {
+    ultimoPagoAprobado = false;
+    res.json({ success: true });
 });
 
 // Iniciar servidor
